@@ -1,5 +1,6 @@
 import os
 import tempfile
+import sys
 from itertools import chain
 from shutil import rmtree
 from unittest import skipIf
@@ -33,7 +34,7 @@ class BaseReplaceAddressTest(Tester):
         r'failed stream session'
     )
 
-    def _setup(self, n=3, opts=None, enable_byteman=False, mixed_versions=False):
+    def _setup(self, n=3, opts=None, enable_byteman=False, mixed_versions=False, replaced_node=None, seeds=None):
         debug("Starting cluster with {} nodes.".format(n))
         self.cluster.populate(n)
         if opts is not None:
@@ -42,9 +43,21 @@ class BaseReplaceAddressTest(Tester):
 
         self.cluster.set_batch_commitlog(enabled=True)
         self.query_node = self.cluster.nodelist()[0]
-        self.replaced_node = self.cluster.nodelist()[-1]
+        self.replaced_node = None
+        if replaced_node is not None:
+            debug("Setting replaced_node to: {}".format(self.cluster.nodes))
+            for node in self.cluster.nodelist():
+                if node.address() == replaced_node:
+                    self.replaced_node = node
+            if self.replaced_node is None:
+                raise RuntimeError("Specified replacement node doesn't exist in cluster")
+        else:
+            self.replaced_node = self.cluster.nodelist()[-1]
 
-        self.cluster.seeds.remove(self.replaced_node)
+        if seeds is not None:
+            self.cluster.seeds = seeds
+        else:
+            self.cluster.seeds.remove(self.replaced_node)
         NUM_TOKENS = os.environ.get('NUM_TOKENS', '256')
         if DISABLE_VNODES:
             self.cluster.set_configuration_options(values={'initial_token': None, 'num_tokens': 1})
@@ -91,7 +104,6 @@ class BaseReplaceAddressTest(Tester):
                 debug("Setting options on replacement node: {}".format(opts))
                 self.replacement_node.set_configuration_options(opts)
             self.cluster.add(self.replacement_node, False, data_center=data_center)
-
         if extra_jvm_args is None:
             extra_jvm_args = []
         extra_jvm_args.extend(["-Dcassandra.{}={}".format(jvm_option, replace_address),
@@ -101,7 +113,9 @@ class BaseReplaceAddressTest(Tester):
         self.replacement_node.start(jvm_args=extra_jvm_args,
                                     wait_for_binary_proto=wait_for_binary_proto, wait_other_notice=wait_other_notice)
 
-        if self.cluster.cassandra_version() >= '2.2.8' and same_address:
+        if '-Dcassandra.allow_unsafe_replace=true' not in extra_jvm_args and self.replacement_node.address() in self.cluster.seeds and self.cluster.cassandra_version() >= '3.11.2':
+            return
+        if self.cluster.cassandra_version() >= '2.2.8' and same_address and '-Dcassandra.allow_unsafe_replace=true' not in extra_jvm_args:
             self.replacement_node.watch_log_for("Writes will not be forwarded to this node during replacement",
                                                 timeout=60)
 
@@ -565,6 +579,19 @@ class TestReplaceAddress(BaseReplaceAddressTest):
         self.assertFalse(self.replacement_node.grep_log("Unable to find sufficient sources for streaming range"))
 
         self._verify_data(initial_data, table=table_name, cl=ConsistencyLevel.LOCAL_ONE)
+
+    def test_replace_while_seed(self):
+        self.allow_log_errors = True
+        self._setup(n=3, replaced_node = '127.0.0.2', seeds = ['127.0.0.1', '127.0.0.2'])
+        self.replaced_node.stop(gently=False)
+        debug("Attempting to start without the unsafe flag")
+        self._do_replace(same_address=True, wait_for_binary_proto=False, jvm_option='replace_address_first_boot')
+        self.replacement_node.watch_log_for("Replacing node cannot be in its own seed list. This would prevent it", timeout=60)
+
+        self.replacement_node.stop(gently=False)
+        debug("Restarting with unsafe flag")
+        self._do_replace(same_address=True, wait_for_binary_proto=True, jvm_option='replace_address_first_boot',
+                          extra_jvm_args=['-Dcassandra.allow_unsafe_replace=true'])
 
     def _cleanup(self, node):
         commitlog_dir = os.path.join(node.get_path(), 'commitlogs')

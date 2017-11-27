@@ -96,7 +96,7 @@ CURRENT_TEST = ""
 
 logging.basicConfig(filename=os.path.join(LOG_SAVED_DIR, "dtest.log"),
                     filemode='w',
-                    format='%(asctime)s,%(msecs)d %(name)s %(current_test)s %(levelname)s %(message)s',
+                    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
                     datefmt='%H:%M:%S',
                     level=logging.DEBUG)
 
