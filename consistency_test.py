@@ -609,6 +609,8 @@ class TestAccuracy(TestHelper):
         @jira_ticket CASSANDRA-10584
         Test for a single datacenter, users table, only the each quorum reads.
         """
+        expected_error = r'UnknownColumnFamilyException'
+        self.ignore_log_patterns = [expected_error]
         self.nodes = 5
         self.rf = 3
 
