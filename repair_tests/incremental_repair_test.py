@@ -1,8 +1,11 @@
 import time
+import pytest
+import re
+import logging
+
 from datetime import datetime
 from collections import Counter, namedtuple
 from re import findall, compile
-from unittest import skip
 from uuid import UUID, uuid1
 
 from cassandra import ConsistencyLevel
@@ -10,13 +13,15 @@ from cassandra.query import SimpleStatement
 from cassandra.metadata import Murmur3Token
 from ccmlib.common import is_win
 from ccmlib.node import Node, ToolError
-from nose.plugins.attrib import attr
 
-from dtest import Tester, debug, create_ks, create_cf
+from dtest import Tester, create_ks, create_cf
 from tools.assertions import assert_almost_equal, assert_one
 from tools.data import insert_c1c2
-from tools.decorators import since, no_vnodes
-from tools.misc import new_node
+from tools.misc import new_node, ImmutableMapping
+from tools.jmxutils import make_mbean, JolokiaAgent, remove_perf_disable_shared_mem
+
+since = pytest.mark.since
+logger = logging.getLogger(__name__)
 
 
 class ConsistentState(object):
@@ -29,7 +34,12 @@ class ConsistentState(object):
 
 
 class TestIncRepair(Tester):
-    ignore_log_patterns = (r'Can\'t send migration request: node.*is down',)
+
+    @pytest.fixture(autouse=True)
+    def fixture_add_additional_log_patterns(self, fixture_dtest_setup):
+        fixture_dtest_setup.ignore_log_patterns = (
+            r'Can\'t send migration request: node.*is down'
+        )
 
     @classmethod
     def _get_repaired_data(cls, node, keyspace):
@@ -57,37 +67,38 @@ class TestIncRepair(Tester):
     def assertNoRepairedSSTables(self, node, keyspace):
         """ Checks that no sstables are marked repaired, and none are marked pending repair """
         data = self._get_repaired_data(node, keyspace)
-        self.assertTrue(all([t.repaired == 0 for t in data]), '{}'.format(data))
-        self.assertTrue(all([t.pending_id is None for t in data]))
+        assert all([t.repaired == 0 for t in data]), '{}'.format(data)
+        assert all([t.pending_id is None for t in data])
 
     def assertAllPendingRepairSSTables(self, node, keyspace, pending_id=None):
         """ Checks that no sstables are marked repaired, and all are marked pending repair """
         data = self._get_repaired_data(node, keyspace)
-        self.assertTrue(all([t.repaired == 0 for t in data]), '{}'.format(data))
+        assert all([t.repaired == 0 for t in data]), '{}'.format(data)
         if pending_id:
-            self.assertTrue(all([t.pending_id == pending_id for t in data]))
+            assert all([t.pending_id == pending_id for t in data])
         else:
-            self.assertTrue(all([t.pending_id is not None for t in data]))
+            assert all([t.pending_id is not None for t in data])
 
     def assertAllRepairedSSTables(self, node, keyspace):
         """ Checks that all sstables are marked repaired, and none are marked pending repair """
         data = self._get_repaired_data(node, keyspace)
-        self.assertTrue(all([t.repaired > 0 for t in data]), '{}'.format(data))
-        self.assertTrue(all([t.pending_id is None for t in data]), '{}'.format(data))
+        assert all([t.repaired > 0 for t in data]), '{}'.format(data)
+        assert all([t.pending_id is None for t in data]), '{}'.format(data)
 
     def assertRepairedAndUnrepaired(self, node, keyspace):
         """ Checks that a node has both repaired and unrepaired sstables for a given keyspace """
         data = self._get_repaired_data(node, keyspace)
-        self.assertTrue(any([t.repaired > 0 for t in data]), '{}'.format(data))
-        self.assertTrue(any([t.repaired == 0 for t in data]), '{}'.format(data))
-        self.assertTrue(all([t.pending_id is None for t in data]), '{}'.format(data))
+        assert any([t.repaired > 0 for t in data]), '{}'.format(data)
+        assert any([t.repaired == 0 for t in data]), '{}'.format(data)
+        assert all([t.pending_id is None for t in data]), '{}'.format(data)
 
     @since('4.0')
-    def consistent_repair_test(self):
-        cluster = self.cluster
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False, 'num_tokens': 1, 'commitlog_sync_period_in_ms': 500})
-        cluster.populate(3).start()
-        node1, node2, node3 = cluster.nodelist()
+    def test_consistent_repair(self):
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false',
+                                                                                     'num_tokens': 1,
+                                                                                     'commitlog_sync_period_in_ms': 500})
+        self.cluster.populate(3).start()
+        node1, node2, node3 = self.cluster.nodelist()
 
         # make data inconsistent between nodes
         session = self.patient_exclusive_cql_connection(node3)
@@ -115,15 +126,15 @@ class TestIncRepair(Tester):
         node1.start(wait_other_notice=True, wait_for_binary_proto=True)
 
         # flush and check that no sstables are marked repaired
-        for node in cluster.nodelist():
+        for node in self.cluster.nodelist():
             node.flush()
             self.assertNoRepairedSSTables(node, 'ks')
             session = self.patient_exclusive_cql_connection(node)
             results = list(session.execute("SELECT * FROM system.repairs"))
-            self.assertEqual(len(results), 0, str(results))
+            assert len(results) == 0, str(results)
 
         # disable compaction so we can verify sstables are marked pending repair
-        for node in cluster.nodelist():
+        for node in self.cluster.nodelist():
             node.nodetool('disableautocompaction ks tbl')
 
         node1.repair(options=['ks'])
@@ -131,25 +142,28 @@ class TestIncRepair(Tester):
         # check that all participating nodes have the repair recorded in their system
         # table, that all nodes are listed as participants, and that all sstables are
         # (still) marked pending repair
-        expected_participants = {n.address() for n in cluster.nodelist()}
+        expected_participants = {n.address() for n in self.cluster.nodelist()}
+        expected_participants_wp = {n.address_and_port() for n in self.cluster.nodelist()}
         recorded_pending_ids = set()
-        for node in cluster.nodelist():
+        for node in self.cluster.nodelist():
             session = self.patient_exclusive_cql_connection(node)
             results = list(session.execute("SELECT * FROM system.repairs"))
-            self.assertEqual(len(results), 1)
+            assert len(results) == 1
             result = results[0]
-            self.assertEqual(set(result.participants), expected_participants)
-            self.assertEqual(result.state, ConsistentState.FINALIZED, "4=FINALIZED")
+            assert set(result.participants) == expected_participants
+            if hasattr(result, "participants_wp"):
+                assert set(result.participants_wp) == expected_participants_wp
+            assert result.state, ConsistentState.FINALIZED == "4=FINALIZED"
             pending_id = result.parent_id
             self.assertAllPendingRepairSSTables(node, 'ks', pending_id)
             recorded_pending_ids.add(pending_id)
 
-        self.assertEqual(len(recorded_pending_ids), 1)
+        assert len(recorded_pending_ids) == 1
 
         # sstables are compacted out of pending repair by a compaction
         # task, we disabled compaction earlier in the test, so here we
         # force the compaction and check that all sstables are promoted
-        for node in cluster.nodelist():
+        for node in self.cluster.nodelist():
             node.nodetool('compact ks tbl')
             self.assertAllRepairedSSTables(node, 'ks')
 
@@ -163,18 +177,24 @@ class TestIncRepair(Tester):
         ranges = {'\x00\x00\x00\x08K\xc2\xed\\<\xd3{X\x00\x00\x00\x08r\x04\x89[j\x81\xc4\xe6',
                   '\x00\x00\x00\x08r\x04\x89[j\x81\xc4\xe6\x00\x00\x00\x08\xd8\xcdo\x9e\xcbl\x83\xd4',
                   '\x00\x00\x00\x08\xd8\xcdo\x9e\xcbl\x83\xd4\x00\x00\x00\x08K\xc2\xed\\<\xd3{X'}
-        ranges = {buffer(b) for b in ranges}
+        ranges = {bytes(b, "Latin-1") for b in ranges}
 
         for node in self.cluster.nodelist():
             session = self.patient_exclusive_cql_connection(node)
             session.execute("INSERT INTO system.repairs "
-                            "(parent_id, cfids, coordinator, last_update, participants, ranges, repaired_at, started_at, state) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                            [session_id, {cfid}, node1.address(), now, {n.address() for n in self.cluster.nodelist()},
+                            "(parent_id, cfids, coordinator, coordinator_port, last_update, participants, participants_wp, ranges, repaired_at, started_at, state) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                            [session_id, {cfid}, node1.address(), 7000, now, {n.address() for n in self.cluster.nodelist()},
+                             {str(n.address()) + ":7000" for n in self.cluster.nodelist()},
                              ranges, now, now, ConsistentState.REPAIRING])  # 2=REPAIRING
 
+        # as we faked repairs and inserted directly into system.repairs table, the current
+        # implementation in trunk (LocalSessions) only pulls the sessions via callbacks or
+        # from the system.repairs table once at startup. we need to stop and start the nodes
+        # as a way to force the repair sessions to get populated into the correct in-memory objects
         time.sleep(1)
         for node in self.cluster.nodelist():
+            node.flush()
             node.stop(gently=False)
 
         for node in self.cluster.nodelist():
@@ -183,12 +203,14 @@ class TestIncRepair(Tester):
         return session_id
 
     @since('4.0')
-    def manual_session_fail_test(self):
+    def test_manual_session_fail(self):
         """ check manual failing of repair sessions via nodetool works properly """
-        cluster = self.cluster
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False, 'num_tokens': 1, 'commitlog_sync_period_in_ms': 500})
-        cluster.populate(3).start()
-        node1, node2, node3 = cluster.nodelist()
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false',
+                                                                                     'num_tokens': 1,
+                                                                                     'commitlog_sync_period_in_ms': 500})
+        self.init_default_config()
+        self.cluster.populate(3).start()
+        node1, node2, node3 = self.cluster.nodelist()
 
         # make data inconsistent between nodes
         session = self.patient_exclusive_cql_connection(node3)
@@ -197,35 +219,38 @@ class TestIncRepair(Tester):
 
         for node in self.cluster.nodelist():
             out = node.nodetool('repair_admin')
-            self.assertIn("no sessions", out.stdout)
+            assert "no sessions" in out.stdout
 
         session_id = self._make_fake_session('ks', 'tbl')
 
         for node in self.cluster.nodelist():
             out = node.nodetool('repair_admin')
             lines = out.stdout.split('\n')
-            self.assertGreater(len(lines), 1)
+            assert len(lines) > 1
             line = lines[1]
-            self.assertIn(str(session_id), line)
-            self.assertIn("REPAIRING", line)
+            assert re.match(str(session_id), line)
+            assert "REPAIRING" in line
 
         node1.nodetool("repair_admin --cancel {}".format(session_id))
 
         for node in self.cluster.nodelist():
             out = node.nodetool('repair_admin --all')
             lines = out.stdout.split('\n')
-            self.assertGreater(len(lines), 1)
+            assert len(lines) > 1
             line = lines[1]
-            self.assertIn(str(session_id), line)
-            self.assertIn("FAILED", line)
+            assert re.match(str(session_id), line)
+            assert "FAILED" in line
 
     @since('4.0')
-    def manual_session_cancel_non_coordinator_failure_test(self):
+    def test_manual_session_cancel_non_coordinator_failure(self):
         """ check manual failing of repair sessions via a node other than the coordinator fails """
-        cluster = self.cluster
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False, 'num_tokens': 1, 'commitlog_sync_period_in_ms': 500})
-        cluster.populate(3).start()
-        node1, node2, node3 = cluster.nodelist()
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false',
+                                                                                     'num_tokens': 1,
+                                                                                     'commitlog_sync_period_in_ms': 500})
+
+        self.init_default_config()
+        self.cluster.populate(3).start()
+        node1, node2, node3 = self.cluster.nodelist()
 
         # make data inconsistent between nodes
         session = self.patient_exclusive_cql_connection(node3)
@@ -234,17 +259,17 @@ class TestIncRepair(Tester):
 
         for node in self.cluster.nodelist():
             out = node.nodetool('repair_admin')
-            self.assertIn("no sessions", out.stdout)
+            assert "no sessions" in out.stdout
 
         session_id = self._make_fake_session('ks', 'tbl')
 
         for node in self.cluster.nodelist():
             out = node.nodetool('repair_admin')
             lines = out.stdout.split('\n')
-            self.assertGreater(len(lines), 1)
+            assert len(lines) > 1
             line = lines[1]
-            self.assertIn(str(session_id), line)
-            self.assertIn("REPAIRING", line)
+            assert re.match(str(session_id), line)
+            assert "REPAIRING" in line
 
         try:
             node2.nodetool("repair_admin --cancel {}".format(session_id))
@@ -256,18 +281,20 @@ class TestIncRepair(Tester):
         for node in self.cluster.nodelist():
             out = node.nodetool('repair_admin')
             lines = out.stdout.split('\n')
-            self.assertGreater(len(lines), 1)
+            assert len(lines) > 1
             line = lines[1]
-            self.assertIn(str(session_id), line)
-            self.assertIn("REPAIRING", line)
+            assert re.match(str(session_id), line)
+            assert "REPAIRING" in line
 
     @since('4.0')
-    def manual_session_force_cancel_test(self):
+    def test_manual_session_force_cancel(self):
         """ check manual failing of repair sessions via a non-coordinator works if the --force flag is set """
-        cluster = self.cluster
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False, 'num_tokens': 1, 'commitlog_sync_period_in_ms': 500})
-        cluster.populate(3).start()
-        node1, node2, node3 = cluster.nodelist()
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false',
+                                                                                     'num_tokens': 1,
+                                                                                     'commitlog_sync_period_in_ms': 500})
+        self.init_default_config()
+        self.cluster.populate(3).start()
+        node1, node2, node3 = self.cluster.nodelist()
 
         # make data inconsistent between nodes
         session = self.patient_exclusive_cql_connection(node3)
@@ -276,29 +303,29 @@ class TestIncRepair(Tester):
 
         for node in self.cluster.nodelist():
             out = node.nodetool('repair_admin')
-            self.assertIn("no sessions", out.stdout)
+            assert "no sessions" in out.stdout
 
         session_id = self._make_fake_session('ks', 'tbl')
 
         for node in self.cluster.nodelist():
             out = node.nodetool('repair_admin')
             lines = out.stdout.split('\n')
-            self.assertGreater(len(lines), 1)
+            assert len(lines) > 1
             line = lines[1]
-            self.assertIn(str(session_id), line)
-            self.assertIn("REPAIRING", line)
+            assert re.match(str(session_id), line)
+            assert "REPAIRING" in line
 
         node2.nodetool("repair_admin --cancel {} --force".format(session_id))
 
         for node in self.cluster.nodelist():
             out = node.nodetool('repair_admin --all')
             lines = out.stdout.split('\n')
-            self.assertGreater(len(lines), 1)
+            assert len(lines) > 1
             line = lines[1]
-            self.assertIn(str(session_id), line)
-            self.assertIn("FAILED", line)
+            assert re.match(str(session_id), line)
+            assert "FAILED" in line
 
-    def sstable_marking_test(self):
+    def test_sstable_marking(self):
         """
         * Launch a three node cluster
         * Stop node3
@@ -307,11 +334,11 @@ class TestIncRepair(Tester):
         * Issue an incremental repair, and wait for it to finish
         * Run sstablemetadata on every node, assert that all sstables are marked as repaired
         """
-        cluster = self.cluster
         # hinted handoff can create SSTable that we don't need after node3 restarted
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
-        cluster.populate(3).start()
-        node1, node2, node3 = cluster.nodelist()
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false'})
+        self.init_default_config()
+        self.cluster.populate(3).start()
+        node1, node2, node3 = self.cluster.nodelist()
 
         node3.stop(gently=True)
 
@@ -327,20 +354,20 @@ class TestIncRepair(Tester):
         node3.watch_log_for("Initializing keyspace1.standard1", filename=log_file)
         # wait for things to settle before starting repair
         time.sleep(1)
-        if cluster.version() >= "2.2":
+        if self.cluster.version() >= "2.2":
             node3.repair()
         else:
             node3.nodetool("repair -par -inc")
 
-        if cluster.version() >= '4.0':
+        if self.cluster.version() >= '4.0':
             # sstables are compacted out of pending repair by a compaction
-            for node in cluster.nodelist():
+            for node in self.cluster.nodelist():
                 node.nodetool('compact keyspace1 standard1')
 
-        for out in (node.run_sstablemetadata(keyspace='keyspace1').stdout for node in cluster.nodelist()):
-            self.assertNotIn('Repaired at: 0', out)
+        for out in (node.run_sstablemetadata(keyspace='keyspace1').stdout for node in self.cluster.nodelist()):
+            assert 'Repaired at: 0' not in out
 
-    def multiple_repair_test(self):
+    def test_multiple_repair(self):
         """
         * Launch a three node cluster
         * Create a keyspace with RF 3 and a table
@@ -364,23 +391,26 @@ class TestIncRepair(Tester):
 
         session = self.patient_cql_connection(node1)
         create_ks(session, 'ks', 3)
-        create_cf(session, 'cf', read_repair=0.0, columns={'c1': 'text', 'c2': 'text'})
+        if cluster.version() < '4.0':
+            create_cf(session, 'cf', read_repair=0.0, columns={'c1': 'text', 'c2': 'text'})
+        else:
+            create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
 
-        debug("insert data")
+        logger.debug("insert data")
 
-        insert_c1c2(session, keys=range(1, 50), consistency=ConsistencyLevel.ALL)
+        insert_c1c2(session, keys=list(range(1, 50)), consistency=ConsistencyLevel.ALL)
         node1.flush()
 
-        debug("bringing down node 3")
+        logger.debug("bringing down node 3")
         node3.flush()
         node3.stop(gently=False)
 
-        debug("inserting additional data into node 1 and 2")
-        insert_c1c2(session, keys=range(50, 100), consistency=ConsistencyLevel.TWO)
+        logger.debug("inserting additional data into node 1 and 2")
+        insert_c1c2(session, keys=list(range(50, 100)), consistency=ConsistencyLevel.TWO)
         node1.flush()
         node2.flush()
 
-        debug("restarting and repairing node 3")
+        logger.debug("restarting and repairing node 3")
         node3.start(wait_for_binary_proto=True)
 
         if cluster.version() >= "2.2":
@@ -393,15 +423,15 @@ class TestIncRepair(Tester):
         if is_win:
             time.sleep(2)
 
-        debug("stopping node 2")
+        logger.debug("stopping node 2")
         node2.stop(gently=False)
 
-        debug("inserting data in nodes 1 and 3")
-        insert_c1c2(session, keys=range(100, 150), consistency=ConsistencyLevel.TWO)
+        logger.debug("inserting data in nodes 1 and 3")
+        insert_c1c2(session, keys=list(range(100, 150)), consistency=ConsistencyLevel.TWO)
         node1.flush()
         node3.flush()
 
-        debug("start and repair node 2")
+        logger.debug("start and repair node 2")
         node2.start(wait_for_binary_proto=True)
 
         if cluster.version() >= "2.2":
@@ -409,7 +439,7 @@ class TestIncRepair(Tester):
         else:
             node2.nodetool("repair -par -inc")
 
-        debug("replace node and check data integrity")
+        logger.debug("replace node and check data integrity")
         node3.stop(gently=False)
         node5 = Node('node5', cluster, True, ('127.0.0.5', 9160), ('127.0.0.5', 7000), '7500', '0', None, ('127.0.0.5', 9042))
         cluster.add(node5, False)
@@ -417,7 +447,7 @@ class TestIncRepair(Tester):
 
         assert_one(session, "SELECT COUNT(*) FROM ks.cf LIMIT 200", [149])
 
-    def sstable_repairedset_test(self):
+    def test_sstable_repairedset(self):
         """
         * Launch a two node cluster
         * Insert data with stress
@@ -433,10 +463,10 @@ class TestIncRepair(Tester):
         * Run sstablemetadata on both nodes again, pipe to a new file
         * Verify repairs occurred and repairedAt was updated
         """
-        cluster = self.cluster
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
-        cluster.populate(2).start()
-        node1, node2 = cluster.nodelist()
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false'})
+        self.init_default_config()
+        self.cluster.populate(2).start()
+        node1, node2 = self.cluster.nodelist()
         node1.stress(['write', 'n=10K', 'no-warmup', '-schema', 'replication(factor=2)', 'compaction(strategy=SizeTieredCompactionStrategy,enabled=false)', '-rate', 'threads=50'])
 
         node1.flush()
@@ -451,49 +481,53 @@ class TestIncRepair(Tester):
         initialOut2 = node2.run_sstablemetadata(keyspace='keyspace1').stdout
 
         matches = findall('(?<=Repaired at:).*', '\n'.join([initialOut1, initialOut2]))
-        debug("Repair timestamps are: {}".format(matches))
+        logger.debug("Repair timestamps are: {}".format(matches))
 
         uniquematches = set(matches)
         matchcount = Counter(matches)
 
-        self.assertGreaterEqual(len(uniquematches), 2, uniquematches)
+        assert len(uniquematches) >= 2, uniquematches
 
-        self.assertGreaterEqual(max(matchcount), 1, matchcount)
+        assert len(max(matchcount)) >= 1, matchcount
 
-        self.assertIn('Repaired at: 0', '\n'.join([initialOut1, initialOut2]))
+        assert re.search('Repaired at: 0', '\n'.join([initialOut1, initialOut2]))
 
         node1.stop()
         node2.stress(['write', 'n=15K', 'no-warmup', '-schema', 'replication(factor=2)'])
         node2.flush()
         node1.start(wait_for_binary_proto=True)
 
-        if cluster.version() >= "2.2":
+        if self.cluster.version() >= "2.2":
             node1.repair()
         else:
             node1.nodetool("repair -par -inc")
 
-        if cluster.version() >= '4.0':
+        if self.cluster.version() >= '4.0':
             # sstables are compacted out of pending repair by a compaction
-            for node in cluster.nodelist():
+            for node in self.cluster.nodelist():
                 node.nodetool('compact keyspace1 standard1')
 
         finalOut1 = node1.run_sstablemetadata(keyspace='keyspace1').stdout
+        if not isinstance(finalOut1, str):
+            finalOut1 = finalOut1
         finalOut2 = node2.run_sstablemetadata(keyspace='keyspace1').stdout
+        if not isinstance(finalOut2, str):
+            finalOut2 = finalOut2
 
         matches = findall('(?<=Repaired at:).*', '\n'.join([finalOut1, finalOut2]))
 
-        debug(matches)
+        logger.debug(matches)
 
         uniquematches = set(matches)
         matchcount = Counter(matches)
 
-        self.assertGreaterEqual(len(uniquematches), 2)
+        assert len(uniquematches) >= 2
 
-        self.assertGreaterEqual(max(matchcount), 2)
+        assert len(max(matchcount)) >= 2
 
-        self.assertNotIn('Repaired at: 0', '\n'.join([finalOut1, finalOut2]))
+        assert not re.search('Repaired at: 0', '\n'.join([finalOut1, finalOut2]))
 
-    def compaction_test(self):
+    def test_compaction(self):
         """
         Test we can major compact after an incremental repair
         * Launch a three node cluster
@@ -539,22 +573,22 @@ class TestIncRepair(Tester):
             assert_one(session, "select val from tab where key =" + str(x), [1])
 
     @since("2.2")
-    def multiple_full_repairs_lcs_test(self):
+    def test_multiple_full_repairs_lcs(self):
         """
         @jira_ticket CASSANDRA-11172 - repeated full repairs should not cause infinite loop in getNextBackgroundTask
         """
         cluster = self.cluster
         cluster.populate(2).start(wait_for_binary_proto=True)
         node1, node2 = cluster.nodelist()
-        for x in xrange(0, 10):
+        for x in range(0, 10):
             node1.stress(['write', 'n=100k', 'no-warmup', '-rate', 'threads=10', '-schema', 'compaction(strategy=LeveledCompactionStrategy,sstable_size_in_mb=10)', 'replication(factor=2)'])
             cluster.flush()
             cluster.wait_for_compactions()
             node1.nodetool("repair -full keyspace1 standard1")
 
-    @attr('long')
-    @skip('hangs CI')
-    def multiple_subsequent_repair_test(self):
+    @pytest.mark.env("long")
+    @pytest.mark.skip(reason='hangs CI')
+    def test_multiple_subsequent_repair(self):
         """
         @jira_ticket CASSANDRA-8366
 
@@ -572,55 +606,55 @@ class TestIncRepair(Tester):
         cluster.populate(3).start()
         node1, node2, node3 = cluster.nodelist()
 
-        debug("Inserting data with stress")
+        logger.debug("Inserting data with stress")
         node1.stress(['write', 'n=5M', 'no-warmup', '-rate', 'threads=10', '-schema', 'replication(factor=3)'])
 
-        debug("Flushing nodes")
+        logger.debug("Flushing nodes")
         cluster.flush()
 
-        debug("Waiting compactions to finish")
+        logger.debug("Waiting compactions to finish")
         cluster.wait_for_compactions()
 
         if self.cluster.version() >= '2.2':
-            debug("Repairing node1")
+            logger.debug("Repairing node1")
             node1.nodetool("repair")
-            debug("Repairing node2")
+            logger.debug("Repairing node2")
             node2.nodetool("repair")
-            debug("Repairing node3")
+            logger.debug("Repairing node3")
             node3.nodetool("repair")
         else:
-            debug("Repairing node1")
+            logger.debug("Repairing node1")
             node1.nodetool("repair -par -inc")
-            debug("Repairing node2")
+            logger.debug("Repairing node2")
             node2.nodetool("repair -par -inc")
-            debug("Repairing node3")
+            logger.debug("Repairing node3")
             node3.nodetool("repair -par -inc")
 
-        # Using "print" instead of debug() here is on purpose.  The compactions
+        # Using "print" instead of logger.debug() here is on purpose.  The compactions
         # take a long time and don't print anything by default, which can result
         # in the test being timed out after 20 minutes.  These print statements
         # prevent it from being timed out.
-        print "compacting node1"
+        print("compacting node1")
         node1.compact()
-        print "compacting node2"
+        print("compacting node2")
         node2.compact()
-        print "compacting node3"
+        print("compacting node3")
         node3.compact()
 
         # wait some time to be sure the load size is propagated between nodes
-        debug("Waiting for load size info to be propagated between nodes")
+        logger.debug("Waiting for load size info to be propagated between nodes")
         time.sleep(45)
 
-        load_size_in_kb = float(sum(map(lambda n: n.data_size(), [node1, node2, node3])))
+        load_size_in_kb = float(sum([n.data_size() for n in [node1, node2, node3]]))
         load_size = load_size_in_kb / 1024 / 1024
-        debug("Total Load size: {}GB".format(load_size))
+        logger.debug("Total Load size: {}GB".format(load_size))
 
         # There is still some overhead, but it's lot better. We tolerate 25%.
         expected_load_size = 4.5  # In GB
         assert_almost_equal(load_size, expected_load_size, error=0.25)
 
-    @attr('resource-intensive')
-    def sstable_marking_test_not_intersecting_all_ranges(self):
+    @pytest.mark.resource_intensive
+    def test_sstable_marking_not_intersecting_all_ranges(self):
         """
         @jira_ticket CASSANDRA-10299
         * Launch a four node cluster
@@ -632,21 +666,21 @@ class TestIncRepair(Tester):
         cluster.populate(4).start(wait_for_binary_proto=True)
         node1, node2, node3, node4 = cluster.nodelist()
 
-        debug("Inserting data with stress")
+        logger.debug("Inserting data with stress")
         node1.stress(['write', 'n=3', 'no-warmup', '-rate', 'threads=1', '-schema', 'replication(factor=3)'])
 
-        debug("Flushing nodes")
+        logger.debug("Flushing nodes")
         cluster.flush()
 
         repair_options = '' if self.cluster.version() >= '2.2' else '-inc -par'
 
-        debug("Repairing node 1")
+        logger.debug("Repairing node 1")
         node1.nodetool("repair {}".format(repair_options))
-        debug("Repairing node 2")
+        logger.debug("Repairing node 2")
         node2.nodetool("repair {}".format(repair_options))
-        debug("Repairing node 3")
+        logger.debug("Repairing node 3")
         node3.nodetool("repair {}".format(repair_options))
-        debug("Repairing node 4")
+        logger.debug("Repairing node 4")
         node4.nodetool("repair {}".format(repair_options))
 
         if cluster.version() >= '4.0':
@@ -655,16 +689,17 @@ class TestIncRepair(Tester):
                 node.nodetool('compact keyspace1 standard1')
 
         for out in (node.run_sstablemetadata(keyspace='keyspace1').stdout for node in cluster.nodelist() if len(node.get_sstables('keyspace1', 'standard1')) > 0):
-            self.assertNotIn('Repaired at: 0', out)
+            assert 'Repaired at: 0' not in out
 
-    @no_vnodes()
+    @pytest.mark.no_vnodes
     @since('4.0')
-    def move_test(self):
+    def test_move(self):
         """ Test repaired data remains in sync after a move """
-        cluster = self.cluster
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False, 'commitlog_sync_period_in_ms': 500})
-        cluster.populate(4, tokens=[0, 2**32, 2**48, -(2**32)]).start()
-        node1, node2, node3, node4 = cluster.nodelist()
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false',
+                                                                                     'commitlog_sync_period_in_ms': 500})
+        self.init_default_config()
+        self.cluster.populate(4, tokens=[0, 2**32, 2**48, -(2**32)]).start()
+        node1, node2, node3, node4 = self.cluster.nodelist()
 
         session = self.patient_exclusive_cql_connection(node3)
         session.execute("CREATE KEYSPACE ks WITH REPLICATION={'class':'SimpleStrategy', 'replication_factor': 2}")
@@ -682,25 +717,26 @@ class TestIncRepair(Tester):
             session.execute(stmt, (v, v))
 
         # everything should be in sync
-        for node in cluster.nodelist():
+        for node in self.cluster.nodelist():
             result = node.repair(options=['ks', '--validate'])
-            self.assertIn("Repaired data is in sync", result.stdout)
+            assert "Repaired data is in sync" in result.stdout
 
         node2.nodetool('move {}'.format(2**16))
 
         # everything should still be in sync
-        for node in cluster.nodelist():
+        for node in self.cluster.nodelist():
             result = node.repair(options=['ks', '--validate'])
-            self.assertIn("Repaired data is in sync", result.stdout)
+            assert "Repaired data is in sync" in result.stdout
 
-    @no_vnodes()
+    @pytest.mark.no_vnodes
     @since('4.0')
-    def decommission_test(self):
+    def test_decommission(self):
         """ Test repaired data remains in sync after a decommission """
-        cluster = self.cluster
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False, 'commitlog_sync_period_in_ms': 500})
-        cluster.populate(4).start()
-        node1, node2, node3, node4 = cluster.nodelist()
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false',
+                                                                                     'commitlog_sync_period_in_ms': 500})
+        self.init_default_config()
+        self.cluster.populate(4).start()
+        node1, node2, node3, node4 = self.cluster.nodelist()
 
         session = self.patient_exclusive_cql_connection(node3)
         session.execute("CREATE KEYSPACE ks WITH REPLICATION={'class':'SimpleStrategy', 'replication_factor': 2}")
@@ -718,25 +754,26 @@ class TestIncRepair(Tester):
             session.execute(stmt, (v, v))
 
         # everything should be in sync
-        for node in cluster.nodelist():
+        for node in self.cluster.nodelist():
             result = node.repair(options=['ks', '--validate'])
-            self.assertIn("Repaired data is in sync", result.stdout)
+            assert "Repaired data is in sync" in result.stdout
 
         node2.nodetool('decommission')
 
         # everything should still be in sync
         for node in [node1, node3, node4]:
             result = node.repair(options=['ks', '--validate'])
-            self.assertIn("Repaired data is in sync", result.stdout)
+            assert "Repaired data is in sync" in result.stdout
 
-    @no_vnodes()
+    @pytest.mark.no_vnodes
     @since('4.0')
-    def bootstrap_test(self):
+    def test_bootstrap(self):
         """ Test repaired data remains in sync after a bootstrap """
-        cluster = self.cluster
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False, 'commitlog_sync_period_in_ms': 500})
-        cluster.populate(3).start()
-        node1, node2, node3 = cluster.nodelist()
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false',
+                                                                                     'commitlog_sync_period_in_ms': 500})
+        self.init_default_config()
+        self.cluster.populate(3).start()
+        node1, node2, node3 = self.cluster.nodelist()
 
         session = self.patient_exclusive_cql_connection(node3)
         session.execute("CREATE KEYSPACE ks WITH REPLICATION={'class':'SimpleStrategy', 'replication_factor': 2}")
@@ -756,27 +793,29 @@ class TestIncRepair(Tester):
         # everything should be in sync
         for node in [node1, node2, node3]:
             result = node.repair(options=['ks', '--validate'])
-            self.assertIn("Repaired data is in sync", result.stdout)
+            assert "Repaired data is in sync" in result.stdout
 
         node4 = new_node(self.cluster)
         node4.start(wait_for_binary_proto=True)
 
-        self.assertEqual(len(self.cluster.nodelist()), 4)
+        assert len(self.cluster.nodelist()) == 4
         # everything should still be in sync
         for node in self.cluster.nodelist():
             result = node.repair(options=['ks', '--validate'])
-            self.assertIn("Repaired data is in sync", result.stdout)
+            assert "Repaired data is in sync" in result.stdout
 
     @since('4.0')
-    def force_test(self):
-        """ 
-        forcing an incremental repair should incrementally repair any nodes 
-        that are up, but should not promote the sstables to repaired 
+    def test_force(self):
         """
-        cluster = self.cluster
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False, 'num_tokens': 1, 'commitlog_sync_period_in_ms': 500})
-        cluster.populate(3).start()
-        node1, node2, node3 = cluster.nodelist()
+        forcing an incremental repair should incrementally repair any nodes
+        that are up, but should not promote the sstables to repaired
+        """
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false',
+                                                                                     'num_tokens': 1,
+                                                                                     'commitlog_sync_period_in_ms': 500})
+        self.init_default_config()
+        self.cluster.populate(3).start()
+        node1, node2, node3 = self.cluster.nodelist()
 
         session = self.patient_exclusive_cql_connection(node3)
         session.execute("CREATE KEYSPACE ks WITH REPLICATION={'class':'SimpleStrategy', 'replication_factor': 3}")
@@ -786,10 +825,10 @@ class TestIncRepair(Tester):
         for i in range(10):
             session.execute(stmt, (i, i))
 
-        node2.stop()
+        node2.stop(wait_other_notice=True)
 
         # repair should fail because node2 is down
-        with self.assertRaises(ToolError):
+        with pytest.raises(ToolError):
             node1.repair(options=['ks'])
 
         # run with force flag
@@ -800,15 +839,46 @@ class TestIncRepair(Tester):
         self.assertNoRepairedSSTables(node2, 'ks')
 
     @since('4.0')
-    def hosts_test(self):
-        """ 
-        running an incremental repair with hosts specified should incrementally repair 
-        the given nodes, but should not promote the sstables to repaired 
+    def test_force_with_none_down(self):
         """
-        cluster = self.cluster
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False, 'num_tokens': 1, 'commitlog_sync_period_in_ms': 500})
-        cluster.populate(3).start()
-        node1, node2, node3 = cluster.nodelist()
+        if we force an incremental repair, but all the involved nodes are up, 
+        we should run normally and promote sstables afterwards
+        """
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false',
+                                                                                     'num_tokens': 1,
+                                                                                     'commitlog_sync_period_in_ms': 500})
+        self.init_default_config()
+        self.cluster.populate(3).start()
+        node1, node2, node3 = self.cluster.nodelist()
+
+        session = self.patient_exclusive_cql_connection(node3)
+        session.execute("CREATE KEYSPACE ks WITH REPLICATION={'class':'SimpleStrategy', 'replication_factor': 3}")
+        session.execute("CREATE TABLE ks.tbl (k INT PRIMARY KEY, v INT)")
+        stmt = SimpleStatement("INSERT INTO ks.tbl (k,v) VALUES (%s, %s)")
+        stmt.consistency_level = ConsistencyLevel.ALL
+        for i in range(10):
+            session.execute(stmt, (i, i))
+
+        # run with force flag
+        node1.repair(options=['ks', '--force'])
+
+        # ... and verify everything was still promoted
+        self.assertAllRepairedSSTables(node1, 'ks')
+        self.assertAllRepairedSSTables(node2, 'ks')
+        self.assertAllRepairedSSTables(node3, 'ks')
+
+    @since('4.0')
+    def test_hosts(self):
+        """
+        running an incremental repair with hosts specified should incrementally repair
+        the given nodes, but should not promote the sstables to repaired
+        """
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false',
+                                                                                     'num_tokens': 1,
+                                                                                     'commitlog_sync_period_in_ms': 500})
+        self.init_default_config()
+        self.cluster.populate(3).start()
+        node1, node2, node3 = self.cluster.nodelist()
 
         session = self.patient_exclusive_cql_connection(node3)
         session.execute("CREATE KEYSPACE ks WITH REPLICATION={'class':'SimpleStrategy', 'replication_factor': 3}")
@@ -826,18 +896,18 @@ class TestIncRepair(Tester):
         self.assertNoRepairedSSTables(node2, 'ks')
 
     @since('4.0')
-    def subrange_test(self):
-        """ 
-        running an incremental repair with hosts specified should incrementally repair 
-        the given nodes, but should not promote the sstables to repaired 
+    def test_subrange(self):
         """
-        cluster = self.cluster
-        cluster.set_configuration_options(values={'hinted_handoff_enabled': False,
-                                                  'num_tokens': 1,
-                                                  'commitlog_sync_period_in_ms': 500,
-                                                  'partitioner': 'org.apache.cassandra.dht.Murmur3Partitioner'})
-        cluster.populate(3).start()
-        node1, node2, node3 = cluster.nodelist()
+        running an incremental repair with hosts specified should incrementally repair
+        the given nodes, but should not promote the sstables to repaired
+        """
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false',
+                                                                                     'num_tokens': 1,
+                                                                                     'commitlog_sync_period_in_ms': 500,
+                                                                                     'partitioner': 'org.apache.cassandra.dht.Murmur3Partitioner'})
+        self.init_default_config()
+        self.cluster.populate(3).start()
+        node1, node2, node3 = self.cluster.nodelist()
 
         session = self.patient_exclusive_cql_connection(node3)
         session.execute("CREATE KEYSPACE ks WITH REPLICATION={'class':'SimpleStrategy', 'replication_factor': 3}")
@@ -847,12 +917,12 @@ class TestIncRepair(Tester):
         for i in range(10):
             session.execute(stmt, (i, i))
 
-        for node in cluster.nodelist():
+        for node in self.cluster.nodelist():
             node.flush()
             self.assertNoRepairedSSTables(node, 'ks')
 
         # only repair the partition k=0
-        token = Murmur3Token.from_key(str(bytearray([0,0,0,0])))
+        token = Murmur3Token.from_key(bytes([0, 0, 0, 0]))
         # import ipdb; ipdb.set_trace()
         # run with force flag
         node1.repair(options=['ks', '-st', str(token.value - 1), '-et', str(token.value)])
@@ -861,3 +931,202 @@ class TestIncRepair(Tester):
         self.assertRepairedAndUnrepaired(node1, 'ks')
         self.assertRepairedAndUnrepaired(node2, 'ks')
         self.assertRepairedAndUnrepaired(node3, 'ks')
+
+    @since('4.0')
+    def test_repaired_tracking_with_partition_deletes(self):
+        """
+        check that when an tracking repaired data status following a digest mismatch,
+        repaired data mismatches are marked as unconfirmed as we may skip sstables
+        after the partition delete are encountered.
+        @jira_ticket CASSANDRA-14145
+        """
+        session, node1, node2 = self.setup_for_repaired_data_tracking()
+        stmt = SimpleStatement("INSERT INTO ks.tbl (k, c, v) VALUES (%s, %s, %s)")
+        stmt.consistency_level = ConsistencyLevel.ALL
+        for i in range(10):
+            session.execute(stmt, (i, i, i))
+
+        for node in self.cluster.nodelist():
+            node.flush()
+            self.assertNoRepairedSSTables(node, 'ks')
+
+        node1.repair(options=['ks'])
+        node2.stop(wait_other_notice=True)
+
+        session.execute("delete from ks.tbl where k = 5")
+
+        node1.flush()
+        node2.start(wait_other_notice=True)
+
+        # expect unconfirmed inconsistencies as the partition deletes cause some sstables to be skipped
+        with JolokiaAgent(node1) as jmx:
+            self.query_and_check_repaired_mismatches(jmx, session, "SELECT * FROM ks.tbl WHERE k = 5",
+                                                     expect_unconfirmed_inconsistencies=True)
+            self.query_and_check_repaired_mismatches(jmx, session, "SELECT * FROM ks.tbl WHERE k = 5 AND c = 5",
+                                                     expect_unconfirmed_inconsistencies=True)
+            # no digest reads for range queries so blocking read repair metric isn't incremented
+            # *all* sstables are read for partition ranges too, and as the repaired set is still in sync there should
+            # be no inconsistencies
+            self.query_and_check_repaired_mismatches(jmx, session, "SELECT * FROM ks.tbl", expect_read_repair=False)
+
+    @since('4.0')
+    def test_repaired_tracking_with_varying_sstable_sets(self):
+        """
+        verify that repaired data digests are computed over the merged data for each replica
+        and that the particular number of sstables on each doesn't affect the comparisons
+        both replicas start with the same repaired set, comprising 2 sstables. node1's is
+        then compacted and additional unrepaired data added (which overwrites some in the
+        repaired set). We expect the repaired digests to still match as the tracking will
+        force all sstables containing the partitions to be read
+        there are two variants of this, for single partition slice & names reads and range reads
+        @jira_ticket CASSANDRA-14145
+        """
+        session, node1, node2 = self.setup_for_repaired_data_tracking()
+        stmt = SimpleStatement("INSERT INTO ks.tbl (k, c, v) VALUES (%s, %s, %s)")
+        stmt.consistency_level = ConsistencyLevel.ALL
+        for i in range(10):
+            session.execute(stmt, (i, i, i))
+
+        for node in self.cluster.nodelist():
+            node.flush()
+
+        for i in range(10,20):
+            session.execute(stmt, (i, i, i))
+
+        for node in self.cluster.nodelist():
+            node.flush()
+            self.assertNoRepairedSSTables(node, 'ks')
+
+        node1.repair(options=['ks'])
+        node2.stop(wait_other_notice=True)
+
+        session.execute("insert into ks.tbl (k, c, v) values (5, 5, 55)")
+        session.execute("insert into ks.tbl (k, c, v) values (15, 15, 155)")
+        node1.flush()
+        node1.compact()
+        node1.compact()
+        node2.start(wait_other_notice=True)
+
+        # we don't expect any inconsistencies as all repaired data is read on both replicas
+        with JolokiaAgent(node1) as jmx:
+            self.query_and_check_repaired_mismatches(jmx, session, "SELECT * FROM ks.tbl WHERE k = 5")
+            self.query_and_check_repaired_mismatches(jmx, session, "SELECT * FROM ks.tbl WHERE k = 5 AND c = 5")
+            # no digest reads for range queries so read repair metric isn't incremented
+            self.query_and_check_repaired_mismatches(jmx, session, "SELECT * FROM ks.tbl", expect_read_repair=False)
+
+    @since('4.0')
+    def test_repaired_tracking_with_mismatching_replicas(self):
+        """
+        verify that when replicas have different repaired sets, this can be detected via the digests
+        computed at read time. All nodes have start with the same data, but only 1 replica's sstables
+        are marked repaired. Then a divergence is introduced by overwriting on 1 replica only, which
+        is required to trigger a digest mismatch & full data read (for single partition reads).
+        As the repaired sets are different between the replicas, but no other shortcutting occurs
+        (no partition tombstones or sstable skipping) and no sstables are involved in pending repair
+        session, we expect confirmed inconsistencies to be reported.
+        there are two variants of this, for single partition slice & names reads and range reads
+        @jira_ticket CASSANDRA-14145
+        """
+        session, node1, node2 = self.setup_for_repaired_data_tracking()
+        stmt = SimpleStatement("INSERT INTO ks.tbl (k, c, v) VALUES (%s, %s, %s)")
+        stmt.consistency_level = ConsistencyLevel.ALL
+        for i in range(10):
+            session.execute(stmt, (i, i, i))
+
+        for node in self.cluster.nodelist():
+            node.flush()
+
+        for i in range(10,20):
+            session.execute(stmt, (i, i, i))
+
+        for node in self.cluster.nodelist():
+            node.flush()
+            self.assertNoRepairedSSTables(node, 'ks')
+
+        # stop node 2 and mark its sstables repaired
+        node2.stop(wait_other_notice=True)
+        node2.run_sstablerepairedset(keyspace='ks')
+        # before restarting node2 overwrite some data on node1 to trigger digest mismatches
+        session.execute("insert into ks.tbl (k, c, v) values (5, 5, 55)")
+        node2.start(wait_for_binary_proto=True)
+
+        out1 = node1.run_sstablemetadata(keyspace='ks').stdout
+        out2 = node2.run_sstablemetadata(keyspace='ks').stdout
+
+        # verify the repaired at times for the sstables on node1/node2
+        assert all(t == 0 for t in [int(x) for x in [y.split(' ')[0] for y in findall('(?<=Repaired at: ).*', out1)]])
+        assert all(t > 0 for t in [int(x) for x in [y.split(' ')[0] for y in findall('(?<=Repaired at: ).*', out2)]])
+
+        # we expect inconsistencies due to sstables being marked repaired on one replica only
+        # these are marked confirmed because no sessions are pending & all sstables are
+        # skipped due to partition deletes
+        with JolokiaAgent(node1) as jmx:
+            self.query_and_check_repaired_mismatches(jmx, session, "SELECT * FROM ks.tbl WHERE k = 5",
+                                                     expect_confirmed_inconsistencies=True)
+            self.query_and_check_repaired_mismatches(jmx, session, "SELECT * FROM ks.tbl WHERE k = 5 AND c = 5",
+                                                     expect_confirmed_inconsistencies=True)
+            # no digest reads for range queries so read repair metric isn't incremented
+            self.query_and_check_repaired_mismatches(jmx, session, "SELECT * FROM ks.tbl", expect_read_repair=False)
+
+    def setup_for_repaired_data_tracking(self):
+        self.fixture_dtest_setup.setup_overrides.cluster_options = ImmutableMapping({'hinted_handoff_enabled': 'false',
+                                                                                     'num_tokens': 1,
+                                                                                     'commitlog_sync_period_in_ms': 500})
+        self.init_default_config()
+        self.cluster.populate(2)
+        node1, node2 = self.cluster.nodelist()
+        remove_perf_disable_shared_mem(node1)  # necessary for jmx
+        self.cluster.start()
+
+        session = self.patient_exclusive_cql_connection(node1)
+        session.execute("CREATE KEYSPACE ks WITH REPLICATION={'class':'SimpleStrategy', 'replication_factor': 2}")
+        session.execute("CREATE TABLE ks.tbl (k INT, c INT, v INT, PRIMARY KEY (k,c)) with read_repair='NONE'")
+        return session, node1, node2
+
+    def query_and_check_repaired_mismatches(self, jmx, session, query,
+                                            expect_read_repair=True,
+                                            expect_unconfirmed_inconsistencies=False,
+                                            expect_confirmed_inconsistencies=False):
+
+        rr_count = make_mbean('metrics', type='ReadRepair', name='ReconcileRead')
+        unconfirmed_count = make_mbean('metrics', type='Table,keyspace=ks', name='RepairedDataInconsistenciesUnconfirmed,scope=tbl')
+        confirmed_count = make_mbean('metrics', type='Table,keyspace=ks', name='RepairedDataInconsistenciesConfirmed,scope=tbl')
+
+        rr_before = self.get_attribute_count(jmx, rr_count)
+        uc_before = self.get_attribute_count(jmx, unconfirmed_count)
+        cc_before = self.get_attribute_count(jmx, confirmed_count)
+
+        stmt = SimpleStatement(query)
+        stmt.consistency_level = ConsistencyLevel.ALL
+        session.execute(stmt)
+
+        rr_after = self.get_attribute_count(jmx, rr_count)
+        uc_after = self.get_attribute_count(jmx, unconfirmed_count)
+        cc_after = self.get_attribute_count(jmx, confirmed_count)
+
+        logger.debug("Read Repair Count: {before}, {after}".format(before=rr_before, after=rr_after))
+        logger.debug("Unconfirmed Inconsistency Count: {before}, {after}".format(before=uc_before, after=uc_after))
+        logger.debug("Confirmed Inconsistency Count: {before}, {after}".format(before=cc_before, after=cc_after))
+
+        if expect_read_repair:
+            assert rr_after > rr_before
+        else:
+            assert rr_after == rr_before
+
+        if expect_unconfirmed_inconsistencies:
+            assert uc_after > uc_before
+        else:
+            assert uc_after == uc_before
+
+        if expect_confirmed_inconsistencies:
+            assert cc_after > cc_before
+        else:
+            assert cc_after == cc_before
+
+    def get_attribute_count(self, jmx, bean):
+        # the MBean may not have been initialized, in which case Jolokia agent will return
+        # a HTTP 404 response. If we receive such, we know that the count can only be 0
+        if jmx.has_mbean(bean):
+            return jmx.read_attribute(bean, 'Count')
+        else:
+            return 0

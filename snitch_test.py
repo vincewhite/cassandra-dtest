@@ -1,15 +1,16 @@
 import os
 import socket
 import time
-
-from nose.plugins.attrib import attr
+import pytest
+import logging
 
 from cassandra import ConsistencyLevel
-from dtest import Tester, debug
-from nose.tools import assert_true, assert_equal, assert_greater_equal
-from tools.decorators import since
+from dtest import Tester
 from tools.jmxutils import (JolokiaAgent, make_mbean,
                             remove_perf_disable_shared_mem)
+
+since = pytest.mark.since
+logger = logging.getLogger(__name__)
 
 
 @since('2.2.5')
@@ -21,6 +22,7 @@ class TestGossipingPropertyFileSnitch(Tester):
         s.settimeout(0.1)
         s.connect((address, port))
         s.close()
+
 
     def test_prefer_local_reconnect_on_listen_address(self):
         """
@@ -35,14 +37,28 @@ class TestGossipingPropertyFileSnitch(Tester):
         NODE1_LISTEN_ADDRESS = '127.0.0.1'
         NODE1_BROADCAST_ADDRESS = '127.0.0.3'
 
+        NODE1_LISTEN_FMT_ADDRESS = '/127.0.0.1'
+        NODE1_BROADCAST_FMT_ADDRESS = '/127.0.0.3'
+
+        NODE1_40_LISTEN_ADDRESS = '127.0.0.1:7000'
+        NODE1_40_BROADCAST_ADDRESS = '127.0.0.3:7000'
+
         NODE2_LISTEN_ADDRESS = '127.0.0.2'
         NODE2_BROADCAST_ADDRESS = '127.0.0.4'
+
+        NODE2_LISTEN_FMT_ADDRESS = '/127.0.0.2'
+        NODE2_BROADCAST_FMT_ADDRESS = '/127.0.0.4'
+
+        NODE2_40_LISTEN_ADDRESS = '127.0.0.2:7000'
+        NODE2_40_BROADCAST_ADDRESS = '127.0.0.4:7000'
 
         STORAGE_PORT = 7000
 
         cluster = self.cluster
         cluster.populate(2)
         node1, node2 = cluster.nodelist()
+
+        running40 = node1.get_base_cassandra_version() >= 4.0
 
         cluster.seeds = [NODE1_BROADCAST_ADDRESS]
         cluster.set_configuration_options(values={'endpoint_snitch': 'org.apache.cassandra.locator.GossipingPropertyFileSnitch',
@@ -58,8 +74,8 @@ class TestGossipingPropertyFileSnitch(Tester):
                 snitch_file.write("prefer_local=true" + os.linesep)
 
         node1.start(wait_for_binary_proto=True)
-        node1.watch_log_for("Starting Messaging Service on /{}:{}".format(NODE1_LISTEN_ADDRESS, STORAGE_PORT), timeout=60)
-        node1.watch_log_for("Starting Messaging Service on /{}:{}".format(NODE1_BROADCAST_ADDRESS, STORAGE_PORT), timeout=60)
+        node1.watch_log_for("Starting Messaging Service on {}:{}".format(NODE1_40_LISTEN_ADDRESS[:-5] if running40 else NODE1_LISTEN_FMT_ADDRESS, STORAGE_PORT), timeout=60)
+        node1.watch_log_for("Starting Messaging Service on {}:{}".format(NODE1_40_BROADCAST_ADDRESS[:-5] if running40 else NODE1_BROADCAST_FMT_ADDRESS, STORAGE_PORT), timeout=60)
         self._test_connect(NODE1_LISTEN_ADDRESS, STORAGE_PORT)
         self._test_connect(NODE1_BROADCAST_ADDRESS, STORAGE_PORT)
 
@@ -71,34 +87,39 @@ class TestGossipingPropertyFileSnitch(Tester):
         original_rows = list(session.execute("SELECT * FROM {}".format(stress_table)))
 
         node2.start(wait_for_binary_proto=True, wait_other_notice=False)
-        node2.watch_log_for("Starting Messaging Service on /{}:{}".format(NODE2_LISTEN_ADDRESS, STORAGE_PORT), timeout=60)
-        node2.watch_log_for("Starting Messaging Service on /{}:{}".format(NODE2_BROADCAST_ADDRESS, STORAGE_PORT), timeout=60)
+        node2.watch_log_for("Starting Messaging Service on {}:{}".format(NODE2_40_LISTEN_ADDRESS[:-5] if running40 else NODE2_LISTEN_FMT_ADDRESS, STORAGE_PORT), timeout=60)
+        node2.watch_log_for("Starting Messaging Service on {}:{}".format(NODE2_40_BROADCAST_ADDRESS[:-5] if running40 else NODE2_BROADCAST_FMT_ADDRESS, STORAGE_PORT), timeout=60)
         self._test_connect(NODE2_LISTEN_ADDRESS, STORAGE_PORT)
         self._test_connect(NODE2_BROADCAST_ADDRESS, STORAGE_PORT)
 
         # Intiated -> Initiated typo was fixed in 3.10
-        node1.watch_log_for("Ini?tiated reconnect to an Internal IP /{} for the /{}".format(NODE2_LISTEN_ADDRESS,
-                                                                                            NODE2_BROADCAST_ADDRESS), filename='debug.log', timeout=60)
-        node2.watch_log_for("Ini?tiated reconnect to an Internal IP /{} for the /{}".format(NODE1_LISTEN_ADDRESS,
-                                                                                            NODE1_BROADCAST_ADDRESS), filename='debug.log', timeout=60)
+        reconnectFmtString = "Ini?tiated reconnect to an Internal IP {} for the {}"
+        if node1.get_base_cassandra_version() >= 3.10:
+            reconnectFmtString = "Initiated reconnect to an Internal IP {} for the {}"
+        node1.watch_log_for(reconnectFmtString.format(NODE2_40_LISTEN_ADDRESS if running40 else NODE2_LISTEN_FMT_ADDRESS,
+                                               NODE2_40_BROADCAST_ADDRESS if running40 else NODE2_BROADCAST_FMT_ADDRESS), filename='debug.log', timeout=60)
+        node2.watch_log_for(reconnectFmtString.format(NODE1_40_LISTEN_ADDRESS if running40 else NODE1_LISTEN_FMT_ADDRESS,
+                                               NODE1_40_BROADCAST_ADDRESS if running40 else NODE1_BROADCAST_FMT_ADDRESS), filename='debug.log', timeout=60)
 
         # read data from node2 just to make sure data and connectivity is OK
         session = self.patient_exclusive_cql_connection(node2)
         new_rows = list(session.execute("SELECT * FROM {}".format(stress_table)))
-        self.assertEquals(original_rows, new_rows)
+        assert original_rows == new_rows
 
         out, err, _ = node1.nodetool('gossipinfo')
-        self.assertEqual(0, len(err), err)
-        debug(out)
+        assert 0 == len(err), err
+        logger.debug(out)
 
-        self.assertIn("/{}".format(NODE1_BROADCAST_ADDRESS), out)
-        self.assertIn("INTERNAL_IP:6:{}".format(NODE1_LISTEN_ADDRESS), out)
-        self.assertIn("/{}".format(NODE2_BROADCAST_ADDRESS), out)
-        self.assertIn("INTERNAL_IP:6:{}".format(NODE2_LISTEN_ADDRESS), out)
-
+        assert "/{}".format(NODE1_BROADCAST_ADDRESS) in out
+        assert "INTERNAL_IP:{}:{}".format('9' if running40 else '6', NODE1_LISTEN_ADDRESS) in out
+        assert "/{}".format(NODE2_BROADCAST_ADDRESS) in out
+        assert "INTERNAL_IP:{}:{}".format('9' if running40 else '6', NODE2_LISTEN_ADDRESS) in out
+        if running40:
+            assert "INTERNAL_ADDRESS_AND_PORT:7:{}".format(NODE1_40_LISTEN_ADDRESS) in out
+            assert "INTERNAL_ADDRESS_AND_PORT:7:{}".format(NODE1_40_LISTEN_ADDRESS) in out
 
 class TestDynamicEndpointSnitch(Tester):
-    @attr('resource-intensive')
+    @pytest.mark.resource_intensive
     @since('3.10')
     def test_multidatacenter_local_quorum(self):
         '''
@@ -156,20 +177,18 @@ class TestDynamicEndpointSnitch(Tester):
                 for x in range(0, 300):
                     degraded_reads_before = bad_jmx.read_attribute(read_stage, 'Value')
                     scores_before = jmx.read_attribute(des, 'Scores')
-                    assert_true(no_cross_dc(scores_before, [node4, node5, node6]),
-                                "Cross DC scores were present: " + str(scores_before))
+                    assert no_cross_dc(scores_before, [node4, node5, node6]), "Cross DC scores were present: " + str(scores_before)
                     future = session.execute_async(read_stmt, [x])
                     future.result()
                     scores_after = jmx.read_attribute(des, 'Scores')
-                    assert_true(no_cross_dc(scores_after, [node4, node5, node6]),
-                                "Cross DC scores were present: " + str(scores_after))
+                    assert no_cross_dc(scores_after, [node4, node5, node6]), "Cross DC scores were present: " + str(scores_after)
 
                     if snitchable(scores_before, scores_after,
                                   [coordinator_node, healthy_node, degraded_node]):
                         snitchable_count = snitchable_count + 1
                         # If the DES correctly routed the read around the degraded node,
                         # it shouldn't have another completed read request in metrics
-                        assert_equal(degraded_reads_before,
+                        assert (degraded_reads_before ==
                                      bad_jmx.read_attribute(read_stage, 'Value'))
                     else:
                         # sleep to give dynamic snitch time to recalculate scores
@@ -177,4 +196,4 @@ class TestDynamicEndpointSnitch(Tester):
 
                 # check that most reads were snitchable, with some
                 # room allowed in case score recalculation is slow
-                assert_greater_equal(snitchable_count, 250)
+                assert snitchable_count >= 250

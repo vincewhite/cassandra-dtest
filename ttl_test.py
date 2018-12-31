@@ -1,22 +1,34 @@
+import os
 import time
-from collections import OrderedDict
+import pytest
+import logging
 
-from cassandra import ConsistencyLevel
+from collections import OrderedDict
+from distutils import dir_util
+from distutils.version import LooseVersion
+
+from cassandra import ConsistencyLevel, InvalidRequest
 from cassandra.query import SimpleStatement
 from cassandra.util import sortedset
 
-from dtest import Tester, debug, create_ks
+from dtest import Tester, create_ks
 from tools.assertions import (assert_all, assert_almost_equal, assert_none,
                               assert_row_count, assert_unavailable)
-from tools.decorators import since
+
+since = pytest.mark.since
+logger = logging.getLogger(__name__)
+
+from scrub_test import TestHelper
 
 
 @since('2.0')
 class TestTTL(Tester):
     """ Test Time To Live Feature """
 
-    def setUp(self):
-        super(TestTTL, self).setUp()
+    @pytest.fixture(scope='function', autouse=True)
+    def fixture_ttl_test_setup(self, fixture_dtest_setup):
+        self.cluster = fixture_dtest_setup.cluster
+        self.fixture_dtest_setup = fixture_dtest_setup
         self.cluster.populate(1).start()
         [node1] = self.cluster.nodelist()
         self.session1 = self.patient_cql_connection(node1)
@@ -51,9 +63,8 @@ class TestTTL(Tester):
         if real_time_to_wait > 0:
             time.sleep(real_time_to_wait)
 
-    def default_ttl_test(self):
+    def test_default_ttl(self):
         """ Test default_time_to_live specified on a table """
-
         self.prepare(default_time_to_live=1)
         start = time.time()
         self.session1.execute("INSERT INTO ttl_table (key, col1) VALUES (%d, %d)" % (1, 1))
@@ -62,9 +73,8 @@ class TestTTL(Tester):
         self.smart_sleep(start, 3)
         assert_row_count(self.session1, 'ttl_table', 0)
 
-    def insert_ttl_has_priority_on_defaut_ttl_test(self):
+    def test_insert_ttl_has_priority_on_defaut_ttl(self):
         """ Test that a ttl specified during an insert has priority on the default table ttl """
-
         self.prepare(default_time_to_live=1)
 
         start = time.time()
@@ -76,9 +86,8 @@ class TestTTL(Tester):
         self.smart_sleep(start, 7)
         assert_row_count(self.session1, 'ttl_table', 0)
 
-    def insert_ttl_works_without_default_ttl_test(self):
+    def test_insert_ttl_works_without_default_ttl(self):
         """ Test that a ttl specified during an insert works even if a table has no default ttl """
-
         self.prepare()
 
         start = time.time()
@@ -88,9 +97,8 @@ class TestTTL(Tester):
         self.smart_sleep(start, 3)
         assert_row_count(self.session1, 'ttl_table', 0)
 
-    def default_ttl_can_be_removed_test(self):
+    def test_default_ttl_can_be_removed(self):
         """ Test that default_time_to_live can be removed """
-
         self.prepare(default_time_to_live=1)
 
         start = time.time()
@@ -101,9 +109,8 @@ class TestTTL(Tester):
         self.smart_sleep(start, 1.5)
         assert_row_count(self.session1, 'ttl_table', 1)
 
-    def removing_default_ttl_does_not_affect_existing_rows_test(self):
+    def test_removing_default_ttl_does_not_affect_existing_rows(self):
         """ Test that removing a default_time_to_live doesn't affect the existings rows """
-
         self.prepare(default_time_to_live=1)
 
         self.session1.execute("ALTER TABLE ttl_table WITH default_time_to_live = 10;")
@@ -123,9 +130,8 @@ class TestTTL(Tester):
         self.smart_sleep(start, 20)
         assert_row_count(self.session1, 'ttl_table', 1)
 
-    def update_single_column_ttl_test(self):
+    def test_update_single_column_ttl(self):
         """ Test that specifying a TTL on a single column works """
-
         self.prepare()
 
         self.session1.execute("""
@@ -137,9 +143,8 @@ class TestTTL(Tester):
         self.smart_sleep(start, 5)
         assert_all(self.session1, "SELECT * FROM ttl_table;", [[1, None, 1, 1]])
 
-    def update_multiple_columns_ttl_test(self):
+    def test_update_multiple_columns_ttl(self):
         """ Test that specifying a TTL on multiple columns works """
-
         self.prepare()
 
         self.session1.execute("""
@@ -153,12 +158,11 @@ class TestTTL(Tester):
         self.smart_sleep(start, 4)
         assert_all(self.session1, "SELECT * FROM ttl_table;", [[1, None, None, None]])
 
-    def update_column_ttl_with_default_ttl_test(self):
+    def test_update_column_ttl_with_default_ttl(self):
         """
         Test that specifying a column ttl works when a default ttl is set.
         This test specify a lower ttl for the column than the default ttl.
         """
-
         self.prepare(default_time_to_live=8)
 
         start = time.time()
@@ -190,11 +194,10 @@ class TestTTL(Tester):
         self.smart_sleep(start, 8)
         assert_row_count(self.session1, 'ttl_table', 0)
 
-    def remove_column_ttl_test(self):
+    def test_remove_column_ttl(self):
         """
         Test that removing a column ttl works.
         """
-
         self.prepare()
 
         start = time.time()
@@ -206,12 +209,11 @@ class TestTTL(Tester):
         assert_all(self.session1, "SELECT * FROM ttl_table;", [[1, 42, None, None]])
 
     @since('3.6')
-    def set_ttl_to_zero_to_default_ttl_test(self):
+    def test_set_ttl_to_zero_to_default_ttl(self):
         """
         Test that we can remove the default ttl by setting the ttl explicitly to zero.
         CASSANDRA-11207
         """
-
         self.prepare(default_time_to_live=2)
 
         start = time.time()
@@ -225,11 +227,10 @@ class TestTTL(Tester):
         assert_all(self.session1, "SELECT * FROM ttl_table;", [[1, 42, None, None]])
 
     @since('2.1', max_version='3.5')
-    def remove_column_ttl_with_default_ttl_test(self):
+    def test_remove_column_ttl_with_default_ttl(self):
         """
         Test that we cannot remove a column ttl when a default ttl is set.
         """
-
         self.prepare(default_time_to_live=2)
 
         start = time.time()
@@ -247,11 +248,10 @@ class TestTTL(Tester):
         self.smart_sleep(start, 10)
         assert_row_count(self.session1, 'ttl_table', 0)
 
-    def collection_list_ttl_test(self):
+    def test_collection_list_ttl(self):
         """
         Test that ttl has a granularity of elements using a list collection.
         """
-
         self.prepare(default_time_to_live=10)
 
         self.session1.execute("ALTER TABLE ttl_table ADD mylist list<int>;""")
@@ -268,11 +268,10 @@ class TestTTL(Tester):
         self.smart_sleep(start, 12)
         assert_row_count(self.session1, 'ttl_table', 0)
 
-    def collection_set_ttl_test(self):
+    def test_collection_set_ttl(self):
         """
         Test that ttl has a granularity of elements using a set collection.
         """
-
         self.prepare(default_time_to_live=10)
 
         self.session1.execute("ALTER TABLE ttl_table ADD myset set<int>;""")
@@ -297,11 +296,10 @@ class TestTTL(Tester):
         self.smart_sleep(start, 12)
         assert_row_count(self.session1, 'ttl_table', 0)
 
-    def collection_map_ttl_test(self):
+    def test_collection_map_ttl(self):
         """
         Test that ttl has a granularity of elements using a map collection.
         """
-
         self.prepare(default_time_to_live=6)
 
         self.session1.execute("ALTER TABLE ttl_table ADD mymap map<int, int>;""")
@@ -326,7 +324,7 @@ class TestTTL(Tester):
         self.smart_sleep(start, 8)
         assert_row_count(self.session1, 'ttl_table', 0)
 
-    def delete_with_ttl_expired_test(self):
+    def test_delete_with_ttl_expired(self):
         """
         Updating a row with a ttl does not prevent deletion, test for CASSANDRA-6363
         """
@@ -340,16 +338,88 @@ class TestTTL(Tester):
         self.session1.execute("delete from session where id = 'abc' if usr ='abc'")
         assert_row_count(self.session1, 'session', 0)
 
+    @since('2.1')
+    def test_expiration_overflow_policy_cap(self):
+        self._base_expiration_overflow_policy_test(default_ttl=False, policy='CAP')
+
+    @since('2.1')
+    def test_expiration_overflow_policy_cap_default_ttl(self):
+        self._base_expiration_overflow_policy_test(default_ttl=False, policy='CAP')
+
+    @since('3.0')
+    def test_expiration_overflow_policy_capnowarn(self):
+        self._base_expiration_overflow_policy_test(default_ttl=False, policy='CAP_NOWARN')
+
+    @since('3.0')
+    def test_expiration_overflow_policy_capnowarn_default_ttl(self):
+        self._base_expiration_overflow_policy_test(default_ttl=False, policy='CAP_NOWARN')
+
+    @since('2.1')
+    def test_expiration_overflow_policy_reject(self):
+        self._base_expiration_overflow_policy_test(default_ttl=False, policy='REJECT')
+
+    @since('2.1')
+    def test_expiration_overflow_policy_reject_default_ttl(self):
+        self._base_expiration_overflow_policy_test(default_ttl=False, policy='REJECT')
+
+    def _base_expiration_overflow_policy_test(self, default_ttl, policy):
+        """
+        Checks that expiration date overflow policy is correctly applied
+        @jira_ticket CASSANDRA-14092
+        """
+        MAX_TTL = 20 * 365 * 24 * 60 * 60  # 20 years in seconds
+        default_time_to_live = MAX_TTL if default_ttl else None
+        self.prepare(default_time_to_live=default_time_to_live)
+
+        # Restart node with expiration_date_overflow_policy
+        self.cluster.stop()
+        self.cluster.start(jvm_args=['-Dcassandra.expiration_date_overflow_policy={}'.format(policy)], wait_for_binary_proto=True)
+        self.session1 = self.patient_cql_connection(self.cluster.nodelist()[0])
+        self.session1.execute("USE ks;")
+
+        # Try to insert data, should only fail if policy is REJECT
+        query = 'INSERT INTO ttl_table (key, col1) VALUES (%d, %d)' % (1, 1)
+        if not default_time_to_live:
+            query = query + "USING TTL %d" % (MAX_TTL)
+        try:
+            result = self.session1.execute_async(query + ";")
+            result.result()
+            if policy == 'REJECT':
+                self.fail("should throw InvalidRequest")
+            if self.cluster.version() >= '3.0':  # client warn only on 3.0+
+                if policy == 'CAP':
+                    logger.debug("Warning is {}", result.warnings[0])
+                    assert 'exceeds maximum supported expiration' in result.warnings[0], 'Warning not found'
+                else:
+                    assert not result.warnings, "There should be no warnings"
+
+        except InvalidRequest as e:
+            if policy != 'REJECT':
+                self.fail("should not throw InvalidRequest")
+
+        self.cluster.flush()
+        # Data should be present unless policy is reject
+        assert_row_count(self.session1, 'ttl_table', 0 if policy == 'REJECT' else 1)
+
+        # Check that warning is always logged, unless policy is REJECT
+        if policy != 'REJECT':
+            node1 = self.cluster.nodelist()[0]
+            prefix = 'default ' if default_ttl else ''
+            warning = node1.grep_log("Request on table {}.{} with {}ttl of {} seconds exceeds maximum supported expiration"
+                                     .format('ks', 'ttl_table', prefix, MAX_TTL))
+            assert warning, 'Log message should be print for CAP and CAP_NOWARN policy'
+
 
 class TestDistributedTTL(Tester):
     """ Test Time To Live Feature in a distributed environment """
 
-    def setUp(self):
-        super(TestDistributedTTL, self).setUp()
-        self.cluster.populate(2).start()
-        [self.node1, self.node2] = self.cluster.nodelist()
-        self.session1 = self.patient_cql_connection(self.node1)
+    @pytest.fixture(scope='function', autouse=True)
+    def fixture_set_cluster_settings(self, fixture_dtest_setup):
+        fixture_dtest_setup.cluster.populate(2).start()
+        [self.node1, self.node2] = fixture_dtest_setup.cluster.nodelist()
+        self.session1 = fixture_dtest_setup.patient_cql_connection(self.node1)
         create_ks(self.session1, 'ks', 2)
+
 
     def prepare(self, default_time_to_live=None):
         self.session1.execute("DROP TABLE IF EXISTS ttl_table;")
@@ -366,11 +436,10 @@ class TestDistributedTTL(Tester):
 
         self.session1.execute(query)
 
-    def ttl_is_replicated_test(self):
+    def test_ttl_is_replicated(self):
         """
         Test that the ttl setting is replicated properly on all nodes
         """
-
         self.prepare(default_time_to_live=5)
         session1 = self.patient_exclusive_cql_connection(self.node1)
         session2 = self.patient_exclusive_cql_connection(self.node2)
@@ -392,15 +461,14 @@ class TestDistributedTTL(Tester):
 
         # since the two queries are not executed simultaneously, the remaining
         # TTLs can differ by one second
-        self.assertLessEqual(abs(ttl_session1[0][0] - ttl_session2[0][0]), 1)
+        assert abs(ttl_session1[0][0] - ttl_session2[0][0]) <= 1
 
         time.sleep(7)
 
         assert_none(session1, "SELECT * FROM ttl_table;", cl=ConsistencyLevel.ALL)
 
-    def ttl_is_respected_on_delayed_replication_test(self):
+    def test_ttl_is_respected_on_delayed_replication(self):
         """ Test that ttl is respected on delayed replication """
-
         self.prepare()
         self.node2.stop()
         self.session1.execute("""
@@ -437,13 +505,12 @@ class TestDistributedTTL(Tester):
         ttl_1 = self.session1.execute('SELECT ttl(col1) FROM ttl_table;')[0][0]
         ttl_2 = session2.execute('SELECT ttl(col1) FROM ttl_table;')[0][0]
 
-        debug("ttl_1 is {}:".format(ttl_1))
-        debug("ttl_2 is {}:".format(ttl_2))
-        self.assertLessEqual(abs(ttl_1 - ttl_2), 1)
+        logger.debug("ttl_1 is {}:".format(ttl_1))
+        logger.debug("ttl_2 is {}:".format(ttl_2))
+        assert abs(ttl_1 - ttl_2) <= 1
 
-    def ttl_is_respected_on_repair_test(self):
+    def test_ttl_is_respected_on_repair(self):
         """ Test that ttl is respected on repair """
-
         self.prepare()
         self.session1.execute("""
             ALTER KEYSPACE ks WITH REPLICATION =
@@ -489,3 +556,64 @@ class TestDistributedTTL(Tester):
         ttl_session2 = session2.execute('SELECT ttl(col1) FROM ttl_table;')
         ttl_session1 = ttl_session1[0][0] - (time.time() - ttl_start)
         assert_almost_equal(ttl_session1, ttl_session2[0][0], error=0.005)
+
+
+class TestRecoverNegativeExpirationDate(TestHelper):
+
+    @since('2.1')
+    def test_recover_negative_expiration_date_sstables_with_scrub(self):
+        """
+        @jira_ticket CASSANDRA-14092
+        Check that row with negative overflowed ttl is recovered by offline scrub
+        """
+        cluster = self.cluster
+        if self.cluster.version() >= '4':
+            cluster.set_configuration_options(values={'corrupted_tombstone_strategy': 'disabled'})
+        cluster.populate(1).start(wait_for_binary_proto=True)
+        [node] = cluster.nodelist()
+
+        session = self.patient_cql_connection(node)
+        create_ks(session, 'ks', 1)
+        session.execute("DROP TABLE IF EXISTS ttl_table;")
+        query = """
+            CREATE TABLE ttl_table (
+                key int primary key,
+                col1 int,
+                col2 int,
+                col3 int,
+            )
+        """
+        session.execute(query)
+
+        version = '2.1' if self.cluster.version() < LooseVersion('3.0') else \
+                  ('3.0' if self.cluster.version() < LooseVersion('3.11') else '3.11')
+
+        corrupt_sstable_dir = os.path.join('sstables', 'ttl_test', version)
+        table_dir = self.get_table_paths('ttl_table')[0]
+        logger.debug("Copying sstables from {} into {}", corrupt_sstable_dir, table_dir)
+        dir_util.copy_tree(corrupt_sstable_dir, table_dir)
+
+        logger.debug("Load corrupted sstable")
+        node.nodetool('refresh ks ttl_table')
+        node.watch_log_for('Loading new SSTables', timeout=10)
+
+        logger.debug("Check that there are no rows present")
+        assert_row_count(session, 'ttl_table', 0)
+
+        logger.debug("Shutting down node")
+        self.cluster.stop()
+
+        logger.debug("Will run offline scrub on sstable")
+        scrubbed_sstables = self.launch_standalone_scrub('ks', 'ttl_table',
+                                                         reinsert_overflowed_ttl=True,
+                                                         no_validate=True)
+
+        logger.debug("Executed offline scrub on {}", str(scrubbed_sstables))
+
+        logger.debug("Starting node again")
+        self.cluster.start(wait_for_binary_proto=True)
+        session = self.patient_cql_connection(node)
+        session.execute("USE ks;")
+
+        logger.debug("Check that row was recovered")
+        assert_all(session, "SELECT * FROM ttl_table;", [[1, 1, None, None]])

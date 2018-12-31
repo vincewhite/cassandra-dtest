@@ -1,0 +1,8 @@
+RULE sorted live endpoints
+CLASS org.apache.cassandra.locator.SimpleSnitch
+METHOD sortedByProximity
+AT ENTRY
+IF true
+DO
+return $unsortedAddress.sorted(java.util.Comparator.naturalOrder());
+ENDRULE

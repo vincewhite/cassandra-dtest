@@ -1,20 +1,32 @@
+import pytest
+import logging
+
+from dtest_setup_overrides import DTestSetupOverrides
+
 from dtest import Tester
-from thrift_bindings.v22.ttypes import \
+from thrift_bindings.thrift010.ttypes import \
     ConsistencyLevel as ThriftConsistencyLevel
-from thrift_bindings.v22.ttypes import (CfDef, Column, ColumnOrSuperColumn,
+from thrift_bindings.thrift010.ttypes import (CfDef, Column, ColumnOrSuperColumn,
                                         ColumnParent, KsDef, Mutation,
                                         SlicePredicate, SliceRange,
                                         SuperColumn)
-from thrift_tests import get_thrift_client
+from thrift_test import get_thrift_client
 from tools.misc import ImmutableMapping
-from tools.decorators import since
+
+since = pytest.mark.since
+logger = logging.getLogger(__name__)
 
 
 @since('2.0', max_version='4')
 class TestSCCache(Tester):
-    cluster_options = ImmutableMapping({'start_rpc': 'true'})
 
-    def sc_with_row_cache_test(self):
+    @pytest.fixture(scope='function', autouse=True)
+    def fixture_dtest_setup_overrides(self, dtest_config):
+        dtest_setup_overrides = DTestSetupOverrides()
+        dtest_setup_overrides.cluster_options = ImmutableMapping({'start_rpc': 'true'})
+        return dtest_setup_overrides
+
+    def test_sc_with_row_cache(self):
         """ Test for bug reported in #4190 """
         cluster = self.cluster
 
@@ -49,56 +61,56 @@ class TestSCCache(Tester):
 
         client.system_add_column_family(cfdef)
 
-        column = Column(name='name', value='Mina', timestamp=100)
+        column = Column(name='name'.encode(), value='Mina'.encode(), timestamp=100)
         client.batch_mutate(
-            {'mina': {'Users': [Mutation(ColumnOrSuperColumn(super_column=SuperColumn('attrs', [column])))]}},
+            {'mina'.encode(): {'Users': [Mutation(ColumnOrSuperColumn(super_column=SuperColumn('attrs'.encode(), [column])))]}},
             ThriftConsistencyLevel.ONE)
 
         column_parent = ColumnParent(column_family='Users')
-        predicate = SlicePredicate(slice_range=SliceRange("", "", False, 100))
-        super_columns = client.get_slice('mina', column_parent, predicate, ThriftConsistencyLevel.ONE)
-        self.assertEqual(1, len(super_columns))
+        predicate = SlicePredicate(slice_range=SliceRange("".encode(), "".encode(), False, 100))
+        super_columns = client.get_slice('mina'.encode(), column_parent, predicate, ThriftConsistencyLevel.ONE)
+        assert 1 == len(super_columns)
         super_column = super_columns[0].super_column
-        self.assertEqual('attrs', super_column.name)
-        self.assertEqual(1, len(super_column.columns))
-        self.assertEqual('name', super_column.columns[0].name)
-        self.assertEqual('Mina', super_column.columns[0].value)
+        assert 'attrs'.encode() == super_column.name
+        assert 1 == len(super_column.columns)
+        assert 'name'.encode() == super_column.columns[0].name
+        assert 'Mina'.encode() == super_column.columns[0].value
 
         # add a 'country' subcolumn
-        column = Column(name='country', value='Canada', timestamp=100)
+        column = Column(name='country'.encode(), value='Canada'.encode(), timestamp=100)
         client.batch_mutate(
-            {'mina': {'Users': [Mutation(ColumnOrSuperColumn(super_column=SuperColumn('attrs', [column])))]}},
+            {'mina'.encode(): {'Users': [Mutation(ColumnOrSuperColumn(super_column=SuperColumn('attrs'.encode(), [column])))]}},
             ThriftConsistencyLevel.ONE)
 
-        super_columns = client.get_slice('mina', column_parent, predicate, ThriftConsistencyLevel.ONE)
-        self.assertEqual(1, len(super_columns))
+        super_columns = client.get_slice('mina'.encode(), column_parent, predicate, ThriftConsistencyLevel.ONE)
+        assert 1 == len(super_columns)
         super_column = super_columns[0].super_column
-        self.assertEqual('attrs', super_column.name)
-        self.assertEqual(2, len(super_column.columns))
+        assert 'attrs'.encode() == super_column.name
+        assert 2 == len(super_column.columns)
 
-        self.assertEqual('country', super_column.columns[0].name)
-        self.assertEqual('Canada', super_column.columns[0].value)
+        assert 'country'.encode() == super_column.columns[0].name
+        assert 'Canada'.encode() == super_column.columns[0].value
 
-        self.assertEqual('name', super_column.columns[1].name)
-        self.assertEqual('Mina', super_column.columns[1].value)
+        assert 'name'.encode() == super_column.columns[1].name
+        assert 'Mina'.encode() == super_column.columns[1].value
 
         # add a 'region' subcolumn
-        column = Column(name='region', value='Quebec', timestamp=100)
+        column = Column(name='region'.encode(), value='Quebec'.encode(), timestamp=100)
         client.batch_mutate(
-            {'mina': {'Users': [Mutation(ColumnOrSuperColumn(super_column=SuperColumn('attrs', [column])))]}},
+            {'mina'.encode(): {'Users': [Mutation(ColumnOrSuperColumn(super_column=SuperColumn('attrs'.encode(), [column])))]}},
             ThriftConsistencyLevel.ONE)
 
-        super_columns = client.get_slice('mina', column_parent, predicate, ThriftConsistencyLevel.ONE)
-        self.assertEqual(1, len(super_columns))
+        super_columns = client.get_slice('mina'.encode(), column_parent, predicate, ThriftConsistencyLevel.ONE)
+        assert 1 == len(super_columns)
         super_column = super_columns[0].super_column
-        self.assertEqual('attrs', super_column.name)
-        self.assertEqual(3, len(super_column.columns))
+        assert 'attrs'.encode() == super_column.name
+        assert 3 == len(super_column.columns)
 
-        self.assertEqual('country', super_column.columns[0].name)
-        self.assertEqual('Canada', super_column.columns[0].value)
+        assert 'country'.encode() == super_column.columns[0].name
+        assert 'Canada'.encode() == super_column.columns[0].value
 
-        self.assertEqual('name', super_column.columns[1].name)
-        self.assertEqual('Mina', super_column.columns[1].value)
+        assert 'name'.encode() == super_column.columns[1].name
+        assert 'Mina'.encode() == super_column.columns[1].value
 
-        self.assertEqual('region', super_column.columns[2].name)
-        self.assertEqual('Quebec', super_column.columns[2].value)
+        assert 'region'.encode() == super_column.columns[2].name
+        assert 'Quebec'.encode() == super_column.columns[2].value
