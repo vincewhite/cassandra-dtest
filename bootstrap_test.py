@@ -801,3 +801,50 @@ class TestBootstrap(Tester):
         self.assert_log_had_msg(node3, "Leaving write survey mode and joining ring at operator request", timeout=30)
         assert_bootstrap_state(self, node3, 'COMPLETED', user='cassandra', password='cassandra')
         node3.wait_for_binary_interface(timeout=30)
+
+
+    def test_wait_for_schema(self):
+
+
+        #start a one node cluster
+        cluster = self.cluster
+        cluster.populate(1, install_byteman=True)
+        node1 = cluster.nodes['node1']
+        cluster.start()
+
+        session = self.patient_cql_connection(node1)
+        create_ks(session, 'ks', 2)
+        create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+
+        empty_size = data_size(node1, 'ks','cf')
+
+        keys = 1000;
+        insert_statement = session.prepare("INSERT INTO ks.cf (key, c1, c2) VALUES (?, 'value1', 'value2')")
+        execute_concurrent_with_args(session, insert_statement, [['k%d' % k] for k in range(keys)])
+
+        node1.flush()
+        node1.compact()
+        initial_size = data_size(node1,'ks','cf')
+        #logger.debug("node1 size for ks.cf before bootstrapping node2: %s" % float(initial_size))
+
+        node2 = new_node(cluster)
+        node2.set_configuration_options(values={'request_timeout_in_ms': 10000})
+
+        mark = node2.mark_log()
+
+        node1.byteman_submit(['./byteman/migration_request_sleep.btm'])
+
+        node2.start(jvm_args=["-Dcassandra.migration_task_wait_in_seconds=20"], set_migration_task=False, wait_for_binary_proto=True)
+
+        node2.watch_log_for('Prepare completed. Receiving', from_mark=mark, timeout=6)
+
+        node2.flush()
+        node2.compact()
+        #logger.debug("node2 joined with size for ks.cf : %s" % float(data_size(node2, 'ks','cf')))
+
+        node1.stop()
+        rows = session.execute('SELECT count(*) from ks.cf')
+        assert rows[0][0] == 1000
+        cluster.stop()
+
+        #done
