@@ -1,0 +1,22 @@
+#
+# Sleep for 5s before returning schema
+#
+
+RULE sleep 5s on schema pull request
+CLASS org.apache.cassandra.db.MigrationRequestVerbHandler
+METHOD doVerb
+AT ENTRY
+IF NOT flagged("done")
+DO
+   flag("done");
+   createCountDown($0, 4)
+ENDRULE
+
+RULE test
+CLASS org.apache.cassandra.db.MigrationRequestVerbHandler
+METHOD doVerb
+AT ENTRY
+IF NOT countDown($0)
+DO Thread.sleep(12000)
+ENDRULE
+
